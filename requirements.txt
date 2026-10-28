@@ -1,0 +1,21 @@
+# --- Perception layer: Android UI extraction & OCR ---
+uiautomator2==3.2.5
+easyocr==1.7.2
+opencv-python==4.10.0.84
+Pillow==10.4.0
+numpy==1.26.4
+
+# --- Brain layer: local LLM inference via Ollama ---
+ollama==0.3.3
+requests==2.32.3
+
+# --- Actuator layer: ADB control ---
+adbutils==2.8.7
+
+# --- Utilities ---
+python-dotenv==1.0.1
+loguru==0.7.2
+pydantic==2.9.2
+
+# --- Testing ---
+pytest==8.3.3

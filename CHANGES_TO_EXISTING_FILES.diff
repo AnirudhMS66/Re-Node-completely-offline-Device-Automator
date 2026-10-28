@@ -1,0 +1,236 @@
+--- a/.env.example
++++ b/.env.example
+@@ -27,3 +27,6 @@
+ SEND_WAIT_S=5
+ BRAIN_REASONING_TIMEOUT_S=30
+ BRAIN_WARMUP=true
++
++# --- timer / alarm ---
++CLOCK_PACKAGE=
+--- a/brain/brain.py
++++ b/brain/brain.py
+@@ -140,7 +140,7 @@
+ # That keeps the live demo 100% reliable even if a 2B model misclassifies; any disagreement
+ # between the two is logged openly rather than hidden.
+ 
+-WORKFLOW_INTENTS = ("MIRROR", "MAIL", "OTHER")
++WORKFLOW_INTENTS = ("MIRROR", "MAIL", "TIMER", "ALARM", "OTHER")
+ 
+ FALLBACK_PLANS: dict[str, list[str]] = {
+     "MIRROR": [
+@@ -160,6 +160,16 @@
+         "Open the Control Panel and turn Wi-Fi OFF (restore the offline air-gap)",
+         "Press Home and report completion",
+     ],
++    "TIMER": [
++        "Parse the duration with the deterministic clock parser (no LLM guessing of numbers)",
++        "Start the timer through Android's SET_TIMER intent",
++        "Verify a countdown is running in the Clock app; fall back to Clock-app UI automation if not",
++    ],
++    "ALARM": [
++        "Parse the time of day with the deterministic clock parser (am/pm and rollover resolved in code)",
++        "Create the alarm through Android's SET_ALARM intent",
++        "Verify the alarm in the phone's next-alarm setting or the Clock app list; fall back to UI automation if not",
++    ],
+ }
+ 
+ _REASONING_SYSTEM_PROMPT = """You are the cognitive core of Re-Node, an offline Android automation agent. \
+@@ -168,10 +178,12 @@
+ Supported intents:
+ - MIRROR: open the phone camera on the front (selfie) lens so the phone works as a mirror.
+ - MAIL: copy the first note from the Notes app and e-mail it through Gmail, turning Wi-Fi on only for the send and off right after.
++- TIMER: start, stop or show a countdown timer in the Clock app.
++- ALARM: set, cancel or show an alarm in the Clock app.
+ - OTHER: anything else (Wi-Fi/Bluetooth toggles, navigation, etc.).
+ 
+ Respond with ONLY a raw JSON object, no markdown, in exactly this shape:
+-{"intent": "MIRROR" | "MAIL" | "OTHER", "confidence": 0.0-1.0, "reasoning": "one or two sentences", "plan": ["step 1", "step 2"]}
++{"intent": "MIRROR" | "MAIL" | "TIMER" | "ALARM" | "OTHER", "confidence": 0.0-1.0, "reasoning": "one or two sentences", "plan": ["step 1", "step 2"]}
+ """
+ 
+ 
+--- a/config.py
++++ b/config.py
+@@ -87,3 +87,15 @@
+ # Brain "cognitive log" call for the workflows (separate from the per-step action loop above).
+ BRAIN_REASONING_TIMEOUT_S = int(os.getenv("BRAIN_REASONING_TIMEOUT_S", "30"))
+ BRAIN_WARMUP = os.getenv("BRAIN_WARMUP", "true").lower() == "true"
++
++# --- Timer / alarm control (additive; nothing above is changed) ---
++# Leave CLOCK_PACKAGE empty to auto-detect from the candidate list (first installed wins).
++# Run `python inspect_ui.py --packages` to see the clock apps installed on your phone.
++CLOCK_PACKAGE = os.getenv("CLOCK_PACKAGE", "")
++CLOCK_PACKAGE_CANDIDATES = [
++    "com.coloros.alarmclock",               # Realme / Oppo (ColorOS)
++    "com.oplus.alarmclock",                 # Realme / OnePlus / Oppo (ColorOS 12+)
++    "com.sec.android.app.clockpackage",     # Samsung One UI
++    "com.android.deskclock",                # AOSP / many OEMs
++    "com.google.android.deskclock",         # Google Clock (Pixel / stock)
++]
+--- a/inspect_ui.py
++++ b/inspect_ui.py
+@@ -25,7 +25,7 @@
+ 
+ import uiautomator2 as u2
+ 
+-HINT_RE = re.compile(r"note|memo|keep|camera|gm$|gmail|settings", re.IGNORECASE)
++HINT_RE = re.compile(r"note|memo|keep|camera|gm$|gmail|settings|clock|alarm", re.IGNORECASE)
+ 
+ 
+ def parse_bounds(bounds: str):
+@@ -41,7 +41,7 @@
+ def print_packages(device) -> None:
+     out = shell_output(device, "pm list packages")
+     packages = sorted(line.split(":", 1)[1].strip() for line in out.splitlines() if line.startswith("package:"))
+-    print("\nInstalled packages that look like Notes / Camera / Gmail / Settings:")
++    print("\nInstalled packages that look like Notes / Camera / Gmail / Settings / Clock:")
+     for pkg in packages:
+         if HINT_RE.search(pkg) and "overlay" not in pkg and "provider" not in pkg:
+             print(f"  {pkg}")
+--- a/main.py
++++ b/main.py
+@@ -23,6 +23,8 @@
+ from skills import KNOWN_SKILLS, get_cached_skill, match_known_skill, save_learned_skill
+ from utils.logger import logger
+ from workflows import WorkflowContext, match_workflow, run_workflow
++from clock_skill import parse_clock_command
++from clock_workflow import run_clock
+ 
+ STATE_VERIFICATION_DELAY_S = 2.5
+ _SCREENSHOT_PATH = str(config.LOG_DIR / "_last_screen.png")
+@@ -215,6 +217,19 @@
+         )
+         return run_workflow(workflow_name, ctx, goal)
+ 
++    # Timer / alarm commands ("set timer for 5 minutes", "alarm at 7 am"). The parser only claims a command it
++    # fully understands, so everything else falls through to the original routing below.
++    clock_intent = parse_clock_command(goal)
++    if clock_intent:
++        logger.info(f"Matched clock command: {clock_intent.kind}")
++        ctx = WorkflowContext(
++            device=device,
++            dispatcher=dispatcher,
++            find_element=_find_element,
++            capture_ui_state=_capture_ui_state,
++        )
++        return run_clock(ctx, clock_intent, goal)
++
+     skill_name = match_known_skill(goal)
+     if skill_name:
+         logger.info(f"Matched known skill: {skill_name!r} — running fixed macro")
+--- a/workflows.py
++++ b/workflows.py
+@@ -448,6 +448,17 @@
+     {"cls": r"EditText|AutoComplete|RecipientEdit", "desc": r"^to\b"},
+     {"cls": r"EditText|AutoComplete|RecipientEdit", "text": r"^to$"},
+     {"cls": r"EditText|AutoComplete|RecipientEdit", "rid": r":id/(to|recipient)"},
++    {"rid": r"peoplekit_autocomplete"},                      # newer Gmail builds: the To chip input
++    {"cls": r"EditText|AutoComplete|RecipientEdit", "rid": r"autocomplete|recipient"},
++]
++# Anything that only exists on the compose screen. Used to recognise "the composer is open" even when the
++# To field itself has an id/label we do not know (Gmail changes these between versions).
++_COMPOSER_EVIDENCE_CHAIN = [
++    {"rid": r":id/(subject|wc_body|compose_body)$"},
++    {"rid": r"composearea_tap_trap"},
++    {"rid": r":id/send$"},
++    {"cls": "EditText", "text": r"^(subject|compose email)$"},
++    {"cls": "EditText", "desc": r"^(subject|compose email)$"},
+ ]
+ _SUBJECT_CHAIN = [
+     {"rid": r":id/subject$"},
+@@ -467,6 +478,48 @@
+ ]
+ 
+ 
++def _resolve_to(nodes: list[dict], pkg: str) -> dict | None:
++    """The recipient field: the known chain, else the top-most EditText that is not Subject / Body / Cc / Bcc."""
++    node, _ = find_by_chain(nodes, _TO_CHAIN, pkg=pkg)
++    if node:
++        return node
++    edits = [
++        n for n in nodes
++        if n["package"] == pkg and "EditText" in n["class"]
++        and not re.search(r"subject|body|cc|bcc|from", n["resource_id"], re.IGNORECASE)
++        and not re.match(r"^(subject|compose email|cc|bcc|from)\b", (n["text"] or n["content_desc"]).strip(), re.IGNORECASE)
++    ]
++    return min(edits, key=lambda n: (n["bounds"][1], n["bounds"][0])) if edits else None
++
++
++def _wait_composer(ctx: WorkflowContext, pkg: str, timeout: float) -> tuple[dict | None, list[dict]]:
++    """Wait for the Gmail composer. Returns (node to treat as the To field, nodes); node is None if it never opened.
++    If the composer is clearly open but the To field cannot be identified, the evidence node is returned and a
++    UI dump is written to logs/last_failure_ui.txt so the selector can be fixed."""
++    node, nodes = _wait_for(ctx, _TO_CHAIN + _COMPOSER_EVIDENCE_CHAIN, timeout=timeout, pkg=pkg)
++    if node is None:
++        return None, nodes
++    to_node = _resolve_to(nodes, pkg)
++    if to_node is None:
++        logger.warning("[UI] Composer is open but the To field was not recognised; dumping the screen for diagnosis")
++        _dump_debug(ctx, "Gmail composer open, To field not found")
++        return node, nodes
++    return to_node, nodes
++
++
++def _dump_debug(ctx: WorkflowContext, reason: str) -> None:
++    try:
++        lines = [f"Re-Node workflow debug dump: {reason}"]
++        for n in dump_nodes(ctx.device):
++            lines.append(f"{'CLICK' if n['clickable'] else '     '} pkg={n['package']} rid={n['resource_id']!r} text={n['text']!r} "
++                         f"desc={n['content_desc']!r} cls={n['class']} bounds={n['bounds']}")
++        path = config.LOG_DIR / "last_failure_ui.txt"
++        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
++        logger.info(f"[UI] Screen dump saved to {path}")
++    except Exception as exc:  # noqa: BLE001 -- diagnostics only
++        logger.debug(f"_dump_debug failed: {exc}")
++
++
+ def _find_body(nodes: list[dict], pkg: str) -> dict | None:
+     """Gmail's message-body field, via a chain: known ids -> 'Compose email' hint -> largest non-header
+     EditText -> the tap-trap that focuses the body."""
+@@ -608,19 +661,23 @@
+                 continue
+             logger.info(f"[PERCEPTION] Compose button: {_node_label(compose)!r}")
+             _tap(ctx, nodes, compose)
+-            to_node, nodes = _wait_for(ctx, _TO_CHAIN, timeout=6, pkg=gmail)
++            to_node, nodes = _wait_composer(ctx, gmail, 6)
+             if to_node:
+                 break
+             logger.warning(f"[UI] Compose screen not detected after tap (attempt {attempt})")
+         if to_node is None:
+             logger.warning("[UI] Falling back to a mailto: intent to open the Gmail composer")
+             ctx.dispatcher.shell("am", "start", "-a", "android.intent.action.SENDTO", "-d", "mailto:", "-p", gmail)
+-            to_node, nodes = _wait_for(ctx, _TO_CHAIN, pkg=gmail)
++            to_node, nodes = _wait_composer(ctx, gmail, config.UI_WAIT_TIMEOUT_S)
+         if to_node is None:
+-            raise WorkflowError("Gmail composer did not open (run `python inspect_ui.py --package com.google.android.gm`)")
++            _dump_debug(ctx, "Gmail composer did not open")
++            raise WorkflowError("Gmail composer did not open (screen saved to logs/last_failure_ui.txt; or run `python inspect_ui.py --package com.google.android.gm`)")
+ 
+         # ---- 7. Fill recipient / subject / body --------------------------------------------
+         _step(7, total, "Filling recipient, subject and body")
++        if _resolve_to(nodes, gmail) is None:
++            _dump_debug(ctx, "composer open but To field not recognised")
++            raise WorkflowError("Gmail composer is open but its To field was not recognised (screen saved to logs/last_failure_ui.txt)")
+         found = _EMAIL_RE.search(note_text)
+         recipient = found.group(0) if found else config.MAIL_DEFAULT_RECIPIENT
+         if recipient == _PLACEHOLDER_RECIPIENT:
+@@ -636,8 +693,9 @@
+         if not _text_on_screen(ctx, recipient, gmail):
+             logger.warning("[ACT] Keystroke entry of recipient not visible; using set_text")
+             nodes = dump_nodes(ctx.device)
+-            to_node, _ = find_by_chain(nodes, _TO_CHAIN, pkg=gmail)
++            to_node = _resolve_to(nodes, gmail)
+             if to_node is None:
++                _dump_debug(ctx, "To field lost")
+                 raise WorkflowError("Lost the To field while entering the recipient")
+             _inject_text(ctx, nodes, to_node, recipient + ",", recipient, gmail)
+ 
+@@ -681,7 +739,7 @@
+             _tap(ctx, nodes, confirm)
+         logger.info(f"[ACT] Send tapped; waiting {config.SEND_WAIT_S:.0f}s for the message to leave the Outbox")
+         time.sleep(config.SEND_WAIT_S)
+-        still_composing, _ = _wait_for(ctx, _TO_CHAIN, timeout=1, pkg=gmail, dismiss=False)
++        still_composing, _ = _wait_for(ctx, _TO_CHAIN + _COMPOSER_EVIDENCE_CHAIN[:2], timeout=1, pkg=gmail, dismiss=False)
+         if still_composing:
+             logger.warning("[UI] The composer still seems to be open - the send may not have gone through")
+ 

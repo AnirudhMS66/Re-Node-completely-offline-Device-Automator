@@ -1,0 +1,15 @@
+{
+ "next_id": 4,
+ "timers": [],
+ "alarms": [
+  {
+   "id": 3,
+   "hour": 7,
+   "minute": 30,
+   "label": "",
+   "days": [],
+   "when_ts": 1793239200.0,
+   "status": "active"
+  }
+ ]
+}
